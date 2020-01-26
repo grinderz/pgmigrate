@@ -4,8 +4,8 @@ PGmigrate - PostgreSQL migrations made easy
 """
 # -*- coding: utf-8 -*-
 #
-#    Copyright (c) 2016-2017 Yandex LLC <https://github.com/yandex>
-#    Copyright (c) 2016-2017 Other contributors as noted in the AUTHORS file.
+#    Copyright (c) 2016-2020 Yandex LLC <https://github.com/yandex>
+#    Copyright (c) 2016-2020 Other contributors as noted in the AUTHORS file.
 #
 #    Permission to use, copy, modify, and distribute this software and its
 #    documentation for any purpose, without fee, and without a written
@@ -34,6 +34,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from builtins import str as text
 from collections import OrderedDict, namedtuple
 from contextlib import closing
@@ -41,6 +42,7 @@ from contextlib import closing
 import psycopg2
 import sqlparse
 import yaml
+from psycopg2.extensions import parse_dsn
 from psycopg2.extras import LoggingConnection
 
 LOG = logging.getLogger(__name__)
@@ -50,42 +52,44 @@ class MigrateError(RuntimeError):
     """
     Common migration error class
     """
-    pass
 
 
 class MalformedStatement(MigrateError):
     """
     Incorrect statement exception
     """
-    pass
 
 
 class MalformedMigration(MigrateError):
     """
     Incorrect migration exception
     """
-    pass
 
 
 class MalformedSchema(MigrateError):
     """
     Incorrect schema exception
     """
-    pass
 
 
 class ConfigurationError(MigrateError):
     """
     Incorrect config or cmd args exception
     """
-    pass
 
 
 class BaselineError(MigrateError):
     """
     Baseline error class
     """
-    pass
+
+
+def get_conn_id(conn):
+    """
+    Extract application_name from dsn
+    """
+    parsed = parse_dsn(conn.dsn)
+    return parsed['application_name']
 
 
 class ConflictTerminator(threading.Thread):
@@ -97,7 +101,7 @@ class ConflictTerminator(threading.Thread):
         self.daemon = True
         self.log = logging.getLogger('terminator')
         self.conn_str = conn_str
-        self.pids = set()
+        self.conns = set()
         self.interval = interval
         self.should_run = True
         self.conn = None
@@ -112,13 +116,13 @@ class ConflictTerminator(threading.Thread):
         """
         Add conn pid to pgmirate pids list
         """
-        self.pids.add(conn.get_backend_pid())
+        self.conns.add(get_conn_id(conn))
 
     def remove_conn(self, conn):
         """
         Remove conn from pgmigrate pids list
         """
-        self.pids.remove(conn.get_backend_pid())
+        self.conns.remove(get_conn_id(conn))
 
     def run(self):
         """
@@ -128,11 +132,17 @@ class ConflictTerminator(threading.Thread):
         self.conn.autocommit = True
         while self.should_run:
             with self.conn.cursor() as cursor:
-                for pid in self.pids:
+                for conn_id in self.conns:
                     cursor.execute(
-                        'SELECT pid, pg_terminate_backend(pid) FROM '
-                        'unnest(pg_blocking_pids(%s)) AS pid',
-                        (pid,))
+                        """
+                        SELECT b.blocking_pid,
+                               pg_terminate_backend(b.blocking_pid)
+                        FROM (SELECT unnest(pg_blocking_pids(pid))
+                              AS blocking_pid
+                              FROM pg_stat_activity
+                              WHERE application_name
+                                  LIKE '%%' || %s || '%%') as b
+                        """, (conn_id, ))
                     terminated = [x[0] for x in cursor.fetchall()]
                     for i in terminated:
                         self.log.info('Terminated conflicting pid: %s', i)
@@ -151,7 +161,9 @@ def _create_raw_connection(conn_string, logger=LOG):
 
 
 def _create_connection(config):
-    conn = _create_raw_connection(config.conn)
+    conn_id = 'pgmigrate-{id}'.format(id=str(uuid.uuid4()))
+    conn = _create_raw_connection('{dsn} application_name={conn_id}'.format(
+        dsn=config.conn, conn_id=conn_id))
     if config.terminator_instance:
         config.terminator_instance.add_conn(conn)
 
@@ -703,11 +715,16 @@ COMMANDS = {
     'migrate': migrate,
 }
 
-CONFIG_DEFAULTS = Config(target=None, baseline=0, cursor=None, dryrun=False,
-                         callbacks='', base_dir='', user=None,
+CONFIG_DEFAULTS = Config(target=None,
+                         baseline=0,
+                         cursor=None,
+                         dryrun=False,
+                         callbacks='',
+                         base_dir='',
+                         user=None,
                          session=['SET lock_timeout = 0'],
                          conn='dbname=postgres user=postgres '
-                              'connect_timeout=1',
+                         'connect_timeout=1',
                          conn_instance=None,
                          terminator_instance=None,
                          termination_interval=None)
@@ -720,7 +737,7 @@ def get_config(base_dir, args=None):
     path = os.path.join(base_dir, 'migrations.yml')
     try:
         with codecs.open(path, encoding='utf-8') as i:
-            base = yaml.load(i.read())
+            base = yaml.safe_load(i)
     except IOError:
         LOG.info('Unable to load %s. Using defaults', path)
         base = {}
@@ -740,9 +757,8 @@ def get_config(base_dir, args=None):
             conf = conf._replace(target=int(conf.target))
 
     if conf.termination_interval and not conf.dryrun:
-        conf = conf._replace(
-            terminator_instance=ConflictTerminator(
-                conf.conn, conf.termination_interval))
+        conf = conf._replace(terminator_instance=ConflictTerminator(
+            conf.conn, conf.termination_interval))
         conf.terminator_instance.start()
 
     conf = conf._replace(conn_instance=_create_connection(conf))
@@ -768,44 +784,47 @@ def _main():
                         choices=COMMANDS.keys(),
                         type=str,
                         help='Operation')
-    parser.add_argument('-t', '--target',
-                        type=str,
-                        help='Target version')
-    parser.add_argument('-c', '--conn',
+    parser.add_argument('-t', '--target', type=str, help='Target version')
+    parser.add_argument('-c',
+                        '--conn',
                         type=str,
                         help='Postgresql connection string')
-    parser.add_argument('-d', '--base_dir',
+    parser.add_argument('-d',
+                        '--base_dir',
                         type=str,
                         default='',
                         help='Migrations base dir')
-    parser.add_argument('-u', '--user',
+    parser.add_argument('-u',
+                        '--user',
                         type=str,
                         help='Override database user in migration info')
-    parser.add_argument('-b', '--baseline',
-                        type=int,
-                        help='Baseline version')
-    parser.add_argument('-a', '--callbacks',
+    parser.add_argument('-b', '--baseline', type=int, help='Baseline version')
+    parser.add_argument('-a',
+                        '--callbacks',
                         type=str,
                         help='Comma-separated list of callbacks '
-                             '(type:dir/file)')
-    parser.add_argument('-s', '--session',
+                        '(type:dir/file)')
+    parser.add_argument('-s',
+                        '--session',
                         action='append',
                         help='Session setup (e.g. isolation level)')
-    parser.add_argument('-n', '--dryrun',
+    parser.add_argument('-n',
+                        '--dryrun',
                         action='store_true',
                         help='Say "rollback" in the end instead of "commit"')
-    parser.add_argument('-l', '--termination_interval',
+    parser.add_argument('-l',
+                        '--termination_interval',
                         type=float,
                         help='Inverval for terminating blocking pids')
-    parser.add_argument('-v', '--verbose',
+    parser.add_argument('-v',
+                        '--verbose',
                         default=0,
                         action='count',
                         help='Be verbose')
 
     args = parser.parse_args()
-    logging.basicConfig(
-        level=(logging.ERROR - 10*(min(3, args.verbose))),
-        format='%(asctime)s %(levelname)-8s: %(message)s')
+    logging.basicConfig(level=(logging.ERROR - 10 * (min(3, args.verbose))),
+                        format='%(asctime)s %(levelname)-8s: %(message)s')
 
     config = get_config(args.base_dir, args)
 
